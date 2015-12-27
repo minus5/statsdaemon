@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -196,12 +195,18 @@ func packetHandler(s *Packet) {
 	}
 }
 
-func submit(deadline time.Time) error {
+func processAll() (bytes.Buffer, int64) {
 	var buffer bytes.Buffer
 	var num int64
-
 	now := time.Now().Unix()
+	num += processCounters(&buffer, now)
+	num += processGauges(&buffer, now)
+	num += processTimers(&buffer, now, percentThreshold)
+	num += processSets(&buffer, now)
+	return buffer, num
+}
 
+func submit(deadline time.Time) error {
 	if *graphiteAddress == "-" {
 		return nil
 	}
@@ -210,13 +215,9 @@ func submit(deadline time.Time) error {
 	if err != nil {
 		if *debug {
 			log.Printf("WARNING: resetting counters when in debug mode")
-			processCounters(&buffer, now)
-			processGauges(&buffer, now)
-			processTimers(&buffer, now, percentThreshold)
-			processSets(&buffer, now)
+			processAll()
 		}
-		errmsg := fmt.Sprintf("dialing %s failed - %s", *graphiteAddress, err)
-		return errors.New(errmsg)
+		return fmt.Errorf("dialing %s failed - %s", *graphiteAddress, err)
 	}
 	defer client.Close()
 
@@ -225,10 +226,7 @@ func submit(deadline time.Time) error {
 		return err
 	}
 
-	num += processCounters(&buffer, now)
-	num += processGauges(&buffer, now)
-	num += processTimers(&buffer, now, percentThreshold)
-	num += processSets(&buffer, now)
+	buffer, num := processAll()
 	if num == 0 {
 		return nil
 	}
@@ -244,8 +242,7 @@ func submit(deadline time.Time) error {
 
 	_, err = client.Write(buffer.Bytes())
 	if err != nil {
-		errmsg := fmt.Sprintf("failed to write stats - %s", err)
-		return errors.New(errmsg)
+		return fmt.Errorf("failed to write stats - %s", err)
 	}
 
 	log.Printf("sent %d stats to %s", num, *graphiteAddress)
