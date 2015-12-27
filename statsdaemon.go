@@ -16,6 +16,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/bitly/go-nsq"
 )
 
 const (
@@ -100,6 +102,8 @@ var (
 	percentThreshold  = Percentiles{}
 	prefix            = flag.String("prefix", "", "Prefix for all stats")
 	postfix           = flag.String("postfix", "", "Postfix for all stats")
+	destNsqdTCPAddrs  = flag.String("nsqd-tcp-address", "", "destination nsqd TCP address")
+	topic             = flag.String("topic", "stats", "NSQ topic to publish to")
 )
 
 func init() {
@@ -117,21 +121,33 @@ var (
 	sets            = make(map[string][]string)
 )
 
+func connectNsq() *nsq.Producer {
+	if *destNsqdTCPAddrs == "" {
+		return nil
+	}
+	cfg := nsq.NewConfig()
+	producer, err := nsq.NewProducer(*destNsqdTCPAddrs, cfg)
+	if err != nil {
+		log.Fatalf("failed to create nsq.Producer - %s", err)
+	}
+	return producer
+}
+
 func monitor() {
 	period := time.Duration(*flushInterval) * time.Second
 	ticker := time.NewTicker(period)
+	nsqProducer := connectNsq()
+	if nsqProducer != nil {
+		log.Printf("connected to nsq")
+	}
 	for {
 		select {
 		case sig := <-signalchan:
 			fmt.Printf("!! Caught signal %v... shutting down\n", sig)
-			if err := submit(time.Now().Add(period)); err != nil {
-				log.Printf("ERROR: %s", err)
-			}
+			submit(time.Now().Add(period), nsqProducer)
 			return
 		case <-ticker.C:
-			if err := submit(time.Now().Add(period)); err != nil {
-				log.Printf("ERROR: %s", err)
-			}
+			submit(time.Now().Add(period), nsqProducer)
 		case s := <-In:
 			packetHandler(s)
 		}
@@ -195,7 +211,7 @@ func packetHandler(s *Packet) {
 	}
 }
 
-func processAll() (bytes.Buffer, int64) {
+func processAll() ([]byte, int64) {
 	var buffer bytes.Buffer
 	var num int64
 	now := time.Now().Unix()
@@ -203,19 +219,48 @@ func processAll() (bytes.Buffer, int64) {
 	num += processGauges(&buffer, now)
 	num += processTimers(&buffer, now, percentThreshold)
 	num += processSets(&buffer, now)
-	return buffer, num
+	return buffer.Bytes(), num
 }
 
-func submit(deadline time.Time) error {
-	if *graphiteAddress == "-" {
-		return nil
+func submit(deadline time.Time, nsqProducer *nsq.Producer) {
+	buf, num := processAll()
+	if num == 0 {
+		return
 	}
 
+	if nsqProducer != nil {
+		err := nsqProducer.Publish(*topic, buf)
+		if err != nil {
+			log.Printf("ERROR: %s", err)
+		} else {
+			log.Printf("sent %d stats to nsqd %s", num, *destNsqdTCPAddrs)
+		}
+	}
+
+	if *graphiteAddress != "-" {
+		err := submitGraphite(deadline, buf)
+		if err != nil {
+			log.Printf("ERROR: %s", err)
+		} else {
+			log.Printf("sent %d stats to graphite %s", num, *graphiteAddress)
+		}
+	}
+
+	if *debug {
+		for _, line := range bytes.Split(buf, []byte("\n")) {
+			if len(line) == 0 {
+				continue
+			}
+			log.Printf("DEBUG: %s", line)
+		}
+	}
+}
+
+func submitGraphite(deadline time.Time, buf []byte) error {
 	client, err := net.Dial("tcp", *graphiteAddress)
 	if err != nil {
 		if *debug {
 			log.Printf("WARNING: resetting counters when in debug mode")
-			processAll()
 		}
 		return fmt.Errorf("dialing %s failed - %s", *graphiteAddress, err)
 	}
@@ -225,27 +270,10 @@ func submit(deadline time.Time) error {
 	if err != nil {
 		return err
 	}
-
-	buffer, num := processAll()
-	if num == 0 {
-		return nil
-	}
-
-	if *debug {
-		for _, line := range bytes.Split(buffer.Bytes(), []byte("\n")) {
-			if len(line) == 0 {
-				continue
-			}
-			log.Printf("DEBUG: %s", line)
-		}
-	}
-
-	_, err = client.Write(buffer.Bytes())
+	_, err = client.Write(buf)
 	if err != nil {
 		return fmt.Errorf("failed to write stats - %s", err)
 	}
-
-	log.Printf("sent %d stats to %s", num, *graphiteAddress)
 
 	return nil
 }
